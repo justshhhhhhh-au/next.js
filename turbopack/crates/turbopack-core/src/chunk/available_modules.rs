@@ -1,8 +1,7 @@
 use anyhow::Result;
 use bincode::{Decode, Encode};
 use turbo_tasks::{
-    FxIndexSet, NonLocalValue, OperationVc, ReadRef, ResolvedVc, TaskInput, TryJoinIterExt,
-    ValueToString, Vc, trace::TraceRawVcs, turbofmt,
+    FxIndexSet, JoinIterExt, OperationVc, ReadRef, ResolvedVc, ValueToString, Vc, turbofmt,
 };
 use turbo_tasks_hash::Xxh3Hash64Hasher;
 
@@ -12,9 +11,8 @@ use crate::{
     module_graph::module_batch::{ChunkableModuleOrBatch, IdentStrings, ModuleBatch},
 };
 
-#[derive(
-    Debug, Copy, Clone, Hash, PartialEq, Eq, TraceRawVcs, NonLocalValue, TaskInput, Encode, Decode,
-)]
+#[turbo_tasks::task_input]
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, Encode, Decode)]
 pub enum AvailableModuleItem {
     Module(ResolvedVc<Box<dyn ChunkableModule>>),
     Batch(ResolvedVc<ModuleBatch>),
@@ -101,9 +99,10 @@ impl AvailableModules {
             .await?
             .iter()
             .map(async |&module| module.ident_strings().await)
-            .try_join()
-            .await?;
+            .join()
+            .await;
         for idents in item_idents {
+            let idents = idents?;
             match idents {
                 IdentStrings::Single(ident) => hasher.write_value(ident),
                 IdentStrings::Multiple(idents) => {

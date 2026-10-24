@@ -2,10 +2,9 @@ use anyhow::Result;
 use bincode::{Decode, Encode};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
+use smallvec::{SmallVec, smallvec};
 use turbo_rcstr::RcStr;
-use turbo_tasks::{
-    NonLocalValue, ResolvedVc, TaskInput, Upcast, Vc, trace::TraceRawVcs, turbobail,
-};
+use turbo_tasks::{ResolvedVc, Upcast, Vc, turbobail};
 use turbo_tasks_fs::FileSystemPath;
 use turbo_tasks_hash::DeterministicHash;
 
@@ -15,8 +14,9 @@ use crate::{
         ChunkItem, ChunkType, ChunkableModule, availability_info::AvailabilityInfo,
         chunk_id_strategy::ModuleIdStrategy,
     },
-    environment::Environment,
+    environment::{ChunkLoading, Environment},
     ident::AssetIdent,
+    json::RcJsonRawValue,
     module::Module,
     module_graph::{
         ModuleGraph, binding_usage_info::ModuleExportUsage, chunk_group_info::ChunkGroup,
@@ -29,20 +29,9 @@ use crate::{
     reference::ModuleReference,
 };
 
+#[turbo_tasks::task_input]
 #[derive(
-    Debug,
-    TaskInput,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    Deserialize,
-    TraceRawVcs,
-    DeterministicHash,
-    NonLocalValue,
-    Encode,
-    Decode,
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, DeterministicHash, Encode, Decode,
 )]
 #[serde(rename_all = "kebab-case")]
 pub enum MangleType {
@@ -50,8 +39,8 @@ pub enum MangleType {
     Deterministic,
 }
 
-#[turbo_tasks::value(shared)]
-#[derive(Debug, TaskInput, Clone, Copy, Hash, DeterministicHash, Deserialize)]
+#[turbo_tasks::value(shared, task_input)]
+#[derive(Debug, Clone, Copy, Hash, DeterministicHash, Deserialize)]
 pub enum MinifyType {
     // TODO instead of adding a new property here,
     // refactor that to Minify(MinifyOptions) to allow defaults on MinifyOptions
@@ -67,8 +56,8 @@ impl Default for MinifyType {
     }
 }
 
-#[turbo_tasks::value(shared)]
-#[derive(Debug, Default, TaskInput, Clone, Copy, Hash, DeterministicHash)]
+#[turbo_tasks::value(shared, task_input)]
+#[derive(Debug, Default, Clone, Copy, Hash, DeterministicHash)]
 pub enum SourceMapsType {
     /// Extracts source maps from input files and writes source maps for output files.
     #[default]
@@ -105,9 +94,9 @@ pub struct UrlBehavior {
     pub static_suffix: ResolvedVc<Option<RcStr>>,
 }
 
+#[turbo_tasks::task_input]
 #[derive(
     Debug,
-    TaskInput,
     Clone,
     Copy,
     PartialEq,
@@ -115,9 +104,7 @@ pub struct UrlBehavior {
     Hash,
     Serialize,
     Deserialize,
-    TraceRawVcs,
     DeterministicHash,
-    NonLocalValue,
     Encode,
     Decode,
 )]
@@ -133,6 +120,7 @@ pub struct ChunkGroupResult {
     pub referenced_assets: ResolvedVc<OutputAssets>,
     pub references: ResolvedVc<OutputAssetsReferences>,
     pub availability_info: AvailabilityInfo,
+    pub chunk_group_bootstrap_params: Option<RcJsonRawValue>,
 }
 
 impl ChunkGroupResult {
@@ -142,6 +130,7 @@ impl ChunkGroupResult {
             referenced_assets: ResolvedVc::cell(vec![]),
             references: ResolvedVc::cell(vec![]),
             availability_info: AvailabilityInfo::root(),
+            chunk_group_bootstrap_params: None,
         }
         .cell()
     }
@@ -152,6 +141,7 @@ impl ChunkGroupResult {
             referenced_assets: ResolvedVc::cell(vec![]),
             references: ResolvedVc::cell(vec![]),
             availability_info: AvailabilityInfo::root(),
+            chunk_group_bootstrap_params: None,
         }
         .resolved_cell()
     }
@@ -185,6 +175,7 @@ impl ChunkGroupResult {
                 .to_resolved()
                 .await?,
             availability_info: next.availability_info,
+            chunk_group_bootstrap_params: next.chunk_group_bootstrap_params.clone(),
         }
         .cell())
     }
@@ -244,19 +235,8 @@ pub struct EntryChunkGroupResult {
     pub availability_info: AvailabilityInfo,
 }
 
-#[derive(
-    Default,
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-    Hash,
-    TraceRawVcs,
-    NonLocalValue,
-    TaskInput,
-    Encode,
-    Decode,
-)]
+#[turbo_tasks::task_input]
+#[derive(Default, Debug, Clone, PartialEq, Eq, Hash, Encode, Decode)]
 pub struct ChunkingConfig {
     /// Try to avoid creating more than 1 chunk smaller than this size.
     /// It merges multiple small chunks into bigger ones to avoid that.
@@ -270,10 +250,32 @@ pub struct ChunkingConfig {
     /// This makes sure that code in big chunks is not duplicated in multiple chunks.
     pub max_merge_chunk_size: usize,
 
+    /// When enabled, a merged chunk also emits its constituent component chunks (referenced,
+    /// loaded on demand) so the runtime can fetch an individual component chunk instead of the
+    /// whole merged chunk when it is already cached.
+    pub generate_component_chunks: bool,
+
+    /// Minimum size for a component chunk to be emitted on its own when
+    /// `generate_component_chunks` is enabled. Component chunks smaller than this are folded
+    /// into a single remainder component chunk.
+    pub min_component_chunk_size: usize,
+
     /// Selects the algorithm used to compute
     /// [`crate::module_graph::style_groups::StyleGroups`]. Only consulted for the CSS chunk
     /// type.
     pub style_groups_algorithm: StyleGroupsAlgorithm,
+
+    /// First-page-load priority as an integer percentage (`0..=100`), or `None` to use the
+    /// default. Used by the production chunker's merge heuristics.
+    pub first_page_load_priority: Option<u32>,
+
+    /// Priority boost as an integer percentage (e.g. `150` for a 1.5x boost), or `None` to use the
+    /// default. Used by the production chunker's merge heuristics.
+    pub priority_boost_percent: Option<u32>,
+
+    /// Estimated request cost in bytes, or `None` to use the default. Used by the production
+    /// chunker's merge heuristics.
+    pub request_cost: Option<u64>,
 
     #[allow(dead_code)]
     pub placeholder_for_future_extensions: (),
@@ -282,8 +284,21 @@ pub struct ChunkingConfig {
 #[turbo_tasks::value(transparent)]
 pub struct ChunkingConfigs(FxHashMap<ResolvedVc<Box<dyn ChunkType>>, ChunkingConfig>);
 
+/// turbopack-browser needs to know the original
+/// source of the hmr chunk list to properly map to a
+/// EcmascriptDevChunkListSource and provide the correct
+/// updates. This maps one to one with that.
+/// We could consider lifting EcmascriptDevChunkListSource to
+/// core instead if this grows. Or using this type in browser instead.
+#[turbo_tasks::task_input]
+#[derive(Eq, PartialEq, Debug, Clone, Copy, Hash, Serialize, Deserialize, Encode, Decode)]
+pub enum HmrChunkListSource {
+    Entry,
+    Dynamic,
+}
+
 #[turbo_tasks::value(shared)]
-#[derive(Debug, Clone, Copy, Hash, TaskInput, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, Hash, Default, Deserialize)]
 pub enum SourceMapSourceType {
     AbsoluteFileUri,
     RelativeUri,
@@ -292,7 +307,25 @@ pub enum SourceMapSourceType {
 }
 
 #[turbo_tasks::value(transparent, cell = "keyed")]
-pub struct UnusedReferences(FxHashSet<ResolvedVc<Box<dyn ModuleReference>>>);
+#[allow(clippy::type_complexity)]
+/// For each reference, the targets it resolves to that were dropped as unused. One reference can
+/// resolve to several targets, which are dropped independently.
+pub struct UnusedReferences(
+    FxHashMap<ResolvedVc<Box<dyn ModuleReference>>, FxHashSet<ResolvedVc<Box<dyn Module>>>>,
+);
+
+#[turbo_tasks::value(shared)]
+#[derive(Debug, Clone, Default)]
+pub struct WorkerConfigurationOptions {
+    /// The worker base-path override. When `Some`, takes precedence over
+    /// `chunk_base_path` for the worker entrypoint URL and the module chunks
+    /// loaded inside the worker.
+    pub asset_prefix: Option<RcStr>,
+    /// The list of global variable names to forward to workers. These globals
+    /// are read from `globalThis` at worker creation time and passed to the
+    /// worker via URL params.
+    pub forwarded_globals: Vec<RcStr>,
+}
 
 /// A context for the chunking that influences the way chunks are created
 #[turbo_tasks::value_trait]
@@ -322,6 +355,11 @@ pub trait ChunkingContext {
     #[turbo_tasks::function]
     fn chunk_root_path(self: Vc<Self>) -> Vc<FileSystemPath>;
 
+    #[turbo_tasks::function]
+    fn chunk_loading(self: Vc<Self>) -> Vc<ChunkLoading> {
+        self.environment().chunk_loading()
+    }
+
     // TODO(alexkirsz) Remove this from the chunking context. This should be at the
     // discretion of chunking context implementors. However, we currently use this
     // in a couple of places in `turbopack-css`, so we need to remove that
@@ -349,6 +387,11 @@ pub trait ChunkingContext {
     /// different usages of the same asset (e.g. different base paths).
     #[turbo_tasks::function]
     fn asset_url(self: Vc<Self>, ident: FileSystemPath, tag: Option<RcStr>) -> Result<Vc<RcStr>>;
+
+    #[turbo_tasks::function]
+    fn service_worker_scope_base_path(self: Vc<Self>) -> Vc<RcStr> {
+        Vc::cell(RcStr::default())
+    }
 
     #[turbo_tasks::function]
     fn asset_path(
@@ -424,17 +467,29 @@ pub trait ChunkingContext {
     fn async_loader_chunk_item_ident(&self, module: Vc<Box<dyn ChunkableModule>>)
     -> Vc<AssetIdent>;
 
+    /// Places a synthesized chunk item into a standalone output chunk without module graph
+    /// traversal.
+    #[turbo_tasks::function]
+    fn standalone_chunk(
+        self: Vc<Self>,
+        chunk_item: ResolvedVc<Box<dyn ChunkItem>>,
+    ) -> Vc<Box<dyn OutputAsset>>;
+
+    /// Chunks `chunk_groups` together as one chunk group, in a single task.
+    ///
+    /// The modules of all groups are collected once each and chunked together, and the resulting
+    /// availability includes every group. `chunk_groups` must not be empty.
     #[turbo_tasks::function]
     fn chunk_group(
         self: Vc<Self>,
         ident: Vc<AssetIdent>,
-        chunk_group: ChunkGroup,
+        chunk_groups: SmallVec<[ChunkGroup; 1]>,
         module_graph: Vc<ModuleGraph>,
         availability_info: AvailabilityInfo,
     ) -> Vc<ChunkGroupResult>;
 
-    /// Like [`Self::chunk_group`], but additionally produces an evaluate chunk
-    /// (and, in dev, a chunk-list register chunk) that bootstraps and runs
+    /// Like [`Self::chunk_group`] for a single `chunk_group`, but additionally produces an
+    /// evaluate chunk (and, in dev, a chunk-list register chunk) that bootstraps and runs
     /// `chunk_group`'s entries.
     ///
     /// `extra_chunks` are not part of this chunk group's module graph, but they
@@ -461,6 +516,7 @@ pub trait ChunkingContext {
         self: Vc<Self>,
         _ident: Vc<AssetIdent>,
         _chunks: Vc<OutputAssets>,
+        _source: HmrChunkListSource,
     ) -> Vc<OutputAssets> {
         OutputAssets::empty()
     }
@@ -496,12 +552,11 @@ pub trait ChunkingContext {
     #[turbo_tasks::function]
     fn debug_ids_enabled(self: Vc<Self>) -> Vc<bool>;
 
-    /// Returns the list of global variable names to forward to workers.
-    /// These globals are read from globalThis at worker creation time and passed
-    /// to the worker via URL params.
+    /// Returns the worker-related configuration: the base-path override and the
+    /// list of globals to forward to workers.
     #[turbo_tasks::function]
-    fn worker_forwarded_globals(self: Vc<Self>) -> Vc<Vec<RcStr>> {
-        Vc::cell(vec![])
+    fn worker_configuration_options(self: Vc<Self>) -> Vc<WorkerConfigurationOptions> {
+        WorkerConfigurationOptions::default().cell()
     }
 
     /// Returns the worker entrypoint for this chunking context.
@@ -599,7 +654,12 @@ impl<T: ChunkingContext + Send + Upcast<Box<dyn ChunkingContext>>> ChunkingConte
         chunk_group: ChunkGroup,
         module_graph: Vc<ModuleGraph>,
     ) -> Vc<ChunkGroupResult> {
-        self.chunk_group(ident, chunk_group, module_graph, AvailabilityInfo::root())
+        self.chunk_group(
+            ident,
+            smallvec![chunk_group],
+            module_graph,
+            AvailabilityInfo::root(),
+        )
     }
 
     fn root_chunk_group_assets(
@@ -817,6 +877,11 @@ fn chunk_group_assets(
     availability_info: AvailabilityInfo,
 ) -> Vc<OutputAssetsWithReferenced> {
     chunking_context
-        .chunk_group(ident, chunk_group, module_graph, availability_info)
+        .chunk_group(
+            ident,
+            smallvec![chunk_group],
+            module_graph,
+            availability_info,
+        )
         .output_assets_with_referenced()
 }
